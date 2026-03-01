@@ -14,3 +14,7 @@
 .cxx
 local.properties
 gradle_error.log
+app/build/
+*/build/
+.idea/
+.vscode/
