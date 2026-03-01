@@ -5,6 +5,8 @@ import android.app.RemoteInput
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Build
@@ -57,17 +59,27 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
+import java.io.RandomAccessFile
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
-    private var mediaRecorder: MediaRecorder? = null
+    private val sampleRate = 44100
+    private val channelConfig = AudioFormat.CHANNEL_IN_MONO
+    private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+    private val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+
+    private var audioRecord: AudioRecord? = null
+    private var isRecording = false
+    private var recordingJob: kotlinx.coroutines.Job? = null
+    
     private var mediaPlayer: MediaPlayer? = null
     
-    private var isRecording by mutableStateOf(false)
+    private var currentRecordingState by mutableStateOf(false)
     private var currentlyPlayingFile by mutableStateOf<File?>(null)
     private var recordings = mutableStateListOf<File>()
     
@@ -121,7 +133,7 @@ class MainActivity : ComponentActivity() {
                         )
                     } else {
                         WearApp(
-                            isRecording = isRecording,
+                            isRecording = currentRecordingState,
                             recordings = recordings,
                             currentlyPlayingFile = currentlyPlayingFile,
                             transcriptions = transcriptions,
@@ -190,7 +202,7 @@ class MainActivity : ComponentActivity() {
                 val fileByteArray = file.readBytes()
                 
                 val inputContent = content {
-                    blob("audio/mp4", fileByteArray)
+                    blob("audio/wav", fileByteArray)
                     text("音声を日本語で正確に文字起こししてください。文字起こしのテキストだけを返してください。")
                 }
                 
@@ -213,7 +225,7 @@ class MainActivity : ComponentActivity() {
     private fun loadRecordings() {
         recordings.clear()
         val cacheDir = externalCacheDir ?: return
-        val files = cacheDir.listFiles { _, name -> name.endsWith(".mp4") }
+        val files = cacheDir.listFiles { _, name -> name.endsWith(".wav") }
         if (files != null) {
             // Sort by last modified descending (newest first)
             recordings.addAll(files.sortedByDescending { it.lastModified() })
@@ -239,40 +251,156 @@ class MainActivity : ComponentActivity() {
         stopPlayback()
 
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-        val outputFilePath = "${externalCacheDir?.absolutePath}/recording_$timeStamp.mp4"
+        val outputFilePath = "${externalCacheDir?.absolutePath}/recording_$timeStamp.wav"
 
-        mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            MediaRecorder(this)
-        } else {
-            @Suppress("DEPRECATION")
-            MediaRecorder()
-        }.apply {
-            setAudioSource(MediaRecorder.AudioSource.MIC)
-            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            setOutputFile(outputFilePath)
-            setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+        try {
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                channelConfig,
+                audioFormat,
+                bufferSize
+            )
 
-            try {
-                prepare()
-                start()
-                isRecording = true
-                Log.d("AudioRecord", "Recording started: $outputFilePath")
-            } catch (e: IOException) {
-                Log.e("AudioRecord", "prepare() failed", e)
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                Log.e("AudioRecord", "AudioRecord initialization failed")
+                return
             }
+
+            audioRecord?.startRecording()
+            isRecording = true
+            currentRecordingState = true
+            Log.d("AudioRecord", "Recording started: $outputFilePath")
+
+            recordingJob = lifecycleScope.launch(Dispatchers.IO) {
+                writeAudioDataToFile(outputFilePath)
+            }
+        } catch (e: SecurityException) {
+            Log.e("AudioRecord", "Missing RECORD_AUDIO permission", e)
+        } catch (e: Exception) {
+            Log.e("AudioRecord", "startRecording() failed", e)
+        }
+    }
+
+    private fun writeAudioDataToFile(outputFilePath: String) {
+        val data = ByteArray(bufferSize)
+        var os: FileOutputStream? = null
+
+        try {
+            os = FileOutputStream(outputFilePath)
+            // Write a dummy header that will be updated when recording stops
+            writeWaveFileHeader(os, 0, 0, sampleRate.toLong(), 1, 16)
+
+            while (isRecording) {
+                val read = audioRecord?.read(data, 0, bufferSize) ?: 0
+                if (read > 0) {
+                    os.write(data, 0, read)
+                }
+            }
+        } catch (e: IOException) {
+            Log.e("AudioRecord", "Failed to write audio data", e)
+        } finally {
+            try {
+                os?.close()
+                // Update header with actual sizes
+                updateWaveFileHeaderSizes(outputFilePath)
+            } catch (e: IOException) {
+                Log.e("AudioRecord", "Failed to close FileOutputStream or update header", e)
+            }
+        }
+    }
+    
+    private fun writeWaveFileHeader(
+        out: FileOutputStream, totalAudioLen: Long, totalDataLen: Long,
+        longSampleRate: Long, channels: Int, byteRate: Long
+    ) {
+        val header = ByteArray(44)
+        header[0] = 'R'.code.toByte()  // RIFF/WAVE header
+        header[1] = 'I'.code.toByte()
+        header[2] = 'F'.code.toByte()
+        header[3] = 'F'.code.toByte()
+        header[4] = (totalDataLen and 0xff).toByte()
+        header[5] = (totalDataLen shr 8 and 0xff).toByte()
+        header[6] = (totalDataLen shr 16 and 0xff).toByte()
+        header[7] = (totalDataLen shr 24 and 0xff).toByte()
+        header[8] = 'W'.code.toByte()
+        header[9] = 'A'.code.toByte()
+        header[10] = 'V'.code.toByte()
+        header[11] = 'E'.code.toByte()
+        header[12] = 'f'.code.toByte() // 'fmt ' chunk
+        header[13] = 'm'.code.toByte()
+        header[14] = 't'.code.toByte()
+        header[15] = ' '.code.toByte()
+        header[16] = 16 // 4 bytes: size of 'fmt ' chunk
+        header[17] = 0
+        header[18] = 0
+        header[19] = 0
+        header[20] = 1 // format = 1
+        header[21] = 0
+        header[22] = channels.toByte()
+        header[23] = 0
+        header[24] = (longSampleRate and 0xff).toByte()
+        header[25] = (longSampleRate shr 8 and 0xff).toByte()
+        header[26] = (longSampleRate shr 16 and 0xff).toByte()
+        header[27] = (longSampleRate shr 24 and 0xff).toByte()
+        header[28] = (byteRate and 0xff).toByte()
+        header[29] = (byteRate shr 8 and 0xff).toByte()
+        header[30] = (byteRate shr 16 and 0xff).toByte()
+        header[31] = (byteRate shr 24 and 0xff).toByte()
+        header[32] = (2 * 16 / 8).toByte() // block align
+        header[33] = 0
+        header[34] = 16 // bits per sample
+        header[35] = 0
+        header[36] = 'd'.code.toByte()
+        header[37] = 'a'.code.toByte()
+        header[38] = 't'.code.toByte()
+        header[39] = 'a'.code.toByte()
+        header[40] = (totalAudioLen and 0xff).toByte()
+        header[41] = (totalAudioLen shr 8 and 0xff).toByte()
+        header[42] = (totalAudioLen shr 16 and 0xff).toByte()
+        header[43] = (totalAudioLen shr 24 and 0xff).toByte()
+        out.write(header, 0, 44)
+    }
+    
+    private fun updateWaveFileHeaderSizes(outputFilePath: String) {
+        try {
+            val file = File(outputFilePath)
+            val fileSize = file.length()
+            val totalAudioLen = fileSize - 44
+            val totalDataLen = fileSize - 8
+            
+            val randomAccessFile = RandomAccessFile(file, "rw")
+            // Update RIFF chunk size
+            randomAccessFile.seek(4)
+            randomAccessFile.write((totalDataLen and 0xff).toInt())
+            randomAccessFile.write((totalDataLen shr 8 and 0xff).toInt())
+            randomAccessFile.write((totalDataLen shr 16 and 0xff).toInt())
+            randomAccessFile.write((totalDataLen shr 24 and 0xff).toInt())
+            // Update data chunk size
+            randomAccessFile.seek(40)
+            randomAccessFile.write((totalAudioLen and 0xff).toInt())
+            randomAccessFile.write((totalAudioLen shr 8 and 0xff).toInt())
+            randomAccessFile.write((totalAudioLen shr 16 and 0xff).toInt())
+            randomAccessFile.write((totalAudioLen shr 24 and 0xff).toInt())
+            randomAccessFile.close()
+        } catch (e: Exception) {
+            Log.e("AudioRecord", "Failed to update WAV header", e)
         }
     }
 
     private fun stopRecording() {
         if (!isRecording) return
 
+        isRecording = false
+        currentRecordingState = false
+        recordingJob?.cancel()
+        
         try {
-            mediaRecorder?.apply {
+            audioRecord?.apply {
                 stop()
                 release()
             }
-            mediaRecorder = null
-            isRecording = false
+            audioRecord = null
             Log.d("AudioRecord", "Recording stopped")
             Toast.makeText(this, "録音完了", Toast.LENGTH_SHORT).show()
             
@@ -316,8 +444,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        mediaRecorder?.release()
-        mediaRecorder = null
+        isRecording = false
+        recordingJob?.cancel()
+        audioRecord?.release()
+        audioRecord = null
         
         mediaPlayer?.release()
         mediaPlayer = null
@@ -460,7 +590,7 @@ fun WearApp(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = file.name.replace("recording_", "").replace(".mp4", ""),
+                            text = file.name.replace("recording_", "").replace(".wav", ""),
                             color = if (isPlaying) Color.Green else Color.White,
                             style = MaterialTheme.typography.body2,
                             modifier = Modifier.weight(1f)
